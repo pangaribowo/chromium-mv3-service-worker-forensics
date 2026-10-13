@@ -3,6 +3,8 @@
     Fix-BraveExtensions - Memulihkan proses Brave & memperbaiki Service Worker ekstensi Manifest V3 (seperti Tab Suspender).
 .PARAMETER CloseAndFixAll
     Jika diaktifkan, akan menutup proses Brave terlebih dahulu agar profil yang sedang terbuka juga dapat di-reset Service Worker Database-nya.
+.PARAMETER BraveUserDataPath
+    Path ke direktori User Data Brave/Chromium (default: %LOCALAPPDATA%\BraveSoftware\Brave-Browser\User Data).
 #>
 param(
     [switch]$CloseAndFixAll,
@@ -48,8 +50,9 @@ if ($idleProcs.Count -gt 0) {
 Write-Host "`n=== Memeriksa Service Worker Ekstensi di Profil Brave ===" -ForegroundColor Cyan
 $braveBase = $BraveUserDataPath
 $profiles = @(if (Test-Path $braveBase) { Get-ChildItem $braveBase -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "Profile*" -or $_.Name -eq "Default" } })
-$needleExt = [System.Text.Encoding]::ASCII.GetBytes("REG:chrome-extension://")
-$needleAny = [System.Text.Encoding]::ASCII.GetBytes("REG:")
+$latin1 = [System.Text.Encoding]::GetEncoding(28591)
+$rxLdbExt = [regex]::new('(?<![a-z])([a-p]{32})(?![a-z])', [System.Text.RegularExpressions.RegexOptions]::Compiled)
+$rxLogExt = [regex]::new('REG:chrome-extension://([a-p]{32})', [System.Text.RegularExpressions.RegexOptions]::Compiled)
 
 $fixedCount = 0
 $healthyCount = 0
@@ -64,12 +67,14 @@ foreach ($prof in $profiles) {
     $csPath = Join-Path $swPath "CacheStorage"
 
     $dbFiles = @(if (Test-Path $dbPath) { Get-ChildItem $dbPath -File -ErrorAction SilentlyContinue })
-    if ((-not (Test-Path $dbPath)) -or ($dbFiles.Count -eq 0)) {
-        if ((Test-Path $scPath) -or (Test-Path $csPath)) {
+    $dbCurrentExists = Test-Path (Join-Path $dbPath "CURRENT")
+    if ((-not (Test-Path $dbPath)) -or (-not $dbCurrentExists) -or ($dbFiles.Count -eq 0)) {
+        if ((Test-Path $dbPath) -or (Test-Path $scPath) -or (Test-Path $csPath)) {
+            if (Test-Path $dbPath) { Remove-Item $dbPath -Recurse -Force -ErrorAction SilentlyContinue }
             if (Test-Path $scPath) { Remove-Item $scPath -Recurse -Force -ErrorAction SilentlyContinue }
             if (Test-Path $csPath) { Remove-Item $csPath -Recurse -Force -ErrorAction SilentlyContinue }
             $fixedCount++
-            Write-Host "[FIXED] $($prof.Name): Orphaned Service Worker ScriptCache/CacheStorage dibersihkan." -ForegroundColor Green
+            Write-Host "[FIXED] $($prof.Name): Orphaned Service Worker Database/ScriptCache/CacheStorage dibersihkan." -ForegroundColor Green
         } else {
             $healthyCount++
         }
@@ -108,6 +113,9 @@ foreach ($prof in $profiles) {
     }
 
     # Periksa status registrasi terakhir ekstensi di LevelDB (.ldb lalu .log)
+    # Catatan: Di file .ldb (SSTable), LevelDB menggunakan prefix delta encoding (shared_bytes) & kompresi Snappy LZ77,
+    # sehingga string "REG:chrome-extension://" terpecah menjadi back-reference, namun 32-char ID [a-p]{32} tetap utuh.
+    # Di file .log (Write-Ahead Log), setiap WriteBatch tidak terkompresi dan diawali [typeByte][keyLenByte]"REG:chrome-extension://<32-id>".
     $extRegState = @{}
     $hasAnyRegistration = $false
     $levelDbFiles = @($dbFiles | Where-Object { $_.Extension -in ".ldb", ".log" } | Sort-Object Extension, Name)
@@ -124,26 +132,31 @@ foreach ($prof in $profiles) {
         }
 
         try {
-
-            for ($i = 0; $i -le $bytes.Length - 4; $i++) {
-                if ($bytes[$i] -eq $needleAny[0] -and $bytes[$i+1] -eq $needleAny[1] -and $bytes[$i+2] -eq $needleAny[2] -and $bytes[$i+3] -eq $needleAny[3]) {
+            $rawText = $latin1.GetString($bytes)
+            if ($lf.Extension -eq ".ldb") {
+                if ($rawText.Contains("REG:") -or $rawText.Contains("UNIQUE_ORIGIN:") -or $rawText.Contains("ID_TO_ORIGIN:")) {
                     $hasAnyRegistration = $true
-                    if ($i -le $bytes.Length - 56) {
-                        $matchExt = $true
-                        for ($j = 0; $j -lt $needleExt.Length; $j++) {
-                            if ($bytes[$i + $j] -ne $needleExt[$j]) { $matchExt = $false; break }
-                        }
-                        if ($matchExt) {
-                            $extId = [System.Text.Encoding]::ASCII.GetString($bytes, $i + $needleExt.Length, 32)
-                            if ($lf.Extension -eq ".log" -and $i -ge 2) {
-                                $typeByte = [int]$bytes[$i - 2]
-                                $keyLenByte = [int]$bytes[$i - 1]
-                                if ($typeByte -in @(0, 1) -and $keyLenByte -ge 50 -and $keyLenByte -le 120) {
-                                    $extRegState[$extId] = $typeByte
-                                }
-                            } elseif ($lf.Extension -eq ".ldb" -and -not $extRegState.ContainsKey($extId)) {
-                                $extRegState[$extId] = 1
-                            }
+                }
+                foreach ($m in $rxLdbExt.Matches($rawText)) {
+                    $extId = $m.Groups[1].Value
+                    $hasAnyRegistration = $true
+                    if (-not $extRegState.ContainsKey($extId)) {
+                        $extRegState[$extId] = 1
+                    }
+                }
+            } elseif ($lf.Extension -eq ".log") {
+                if ($rawText.Contains("REG:")) {
+                    $hasAnyRegistration = $true
+                }
+                foreach ($m in $rxLogExt.Matches($rawText)) {
+                    $hasAnyRegistration = $true
+                    $i = $m.Index
+                    $extId = $m.Groups[1].Value
+                    if ($i -ge 2) {
+                        $typeByte = [int]$bytes[$i - 2]
+                        $keyLenByte = [int]$bytes[$i - 1]
+                        if ($typeByte -in @(0, 1) -and $keyLenByte -ge 50 -and $keyLenByte -le 120) {
+                            $extRegState[$extId] = $typeByte
                         }
                     }
                 }

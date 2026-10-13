@@ -34,12 +34,13 @@ This repository provides the **forensic post-mortem, LevelDB WriteBatch binary s
 
 | Metric / Subsystem Dimension | Pre-Remediation State (Measured) | Post-Remediation State (Measured) | Verification Source |
 | :--- | :---: | :---: | :--- |
-| **Routine Cleaner Behavior (`optimize.ps1`)** | Deleted `ScriptCache` & `CacheStorage` alone *(Induced Split-Brain)* | **Excludes `ScriptCache`/`CacheStorage` + Atomic Self-Heal** | `scripts/optimize.ps1` |
-| **Closed Brave Profiles with Desynced SW** | **14 Closed Profiles** *(Wiped `ScriptCache` / Stale `Database`)* | **14 Closed Profiles Atomically Reset (`Healthy = 14`)** | `scripts/Fix-BraveExtensions.ps1` |
+| **Routine Cleaner Behavior (`optimize.ps1`)** | Deleted `ScriptCache` & `CacheStorage` alone *(Induced Split-Brain)* | **Excludes `ScriptCache`/`CacheStorage` + Atomic Self-Heal (Brave & Chrome)** | `scripts/optimize.ps1` |
+| **Closed Brave & Chrome Profiles Healed** | **14 Brave + 10 Chrome Profiles** *(Wiped `ScriptCache` / Stale `Database`)* | **24 Closed Profiles Atomically Reset (`Clean/Reset`)** | `scripts/Fix-BraveExtensions.ps1` |
 | **Open Brave Profiles (`Profile 2, 6, 9, 22`)** | `Tab Suspender = type=0` (`kTypeDeletion` in `.log`) | **Detected & Guided via `brave://restart` (0 Tab Loss)** | LevelDB `.log` WriteBatch scan |
+| **Compacted `.ldb` SSTable Detection (`000009.ldb`)** | Missed Snappy/prefix-compressed `REG:` keys (`0/9` found) | **9/9 Extensions Detected via Latin1 `[a-p]{32}` (~485 ms total)** | `Fix-BraveExtensions.ps1` & `Audit-BraveExtensionStorage.ps1` |
 | **`Database` vs `ScriptCache` Timestamp Delta** | **+39,865 min to +246,632 min** *(`DbCurrent` vs `ScIndex`)* | **0 min Desync on Healed Profiles** | Filesystem `CreationTime` audit |
 | **Windows Power Throttling (`brave.exe`)** | Enabled / Dynamic *(14 processes at `Idle` / `BasePriority 4`)* | **`Disabled (Never On)` + Elevated to `Normal` (`BasePriority 8`)** | `powercfg /powerthrottling` & `Get-Process` |
-| **Extension Data Preservation (`Local Extension Settings`)** | At risk if extension toggled/reinstalled | **100% Preserved across all 18 profiles** | Automated & Live Directory Audit |
+| **Extension Data Preservation (`Local Extension Settings`)** | At risk if extension toggled/reinstalled | **100% Preserved across all 18 Brave + 10 Chrome profiles** | Automated & Live Directory Audit |
 | **`Profile 9` Tab Suspender Storage Footprint** | **36.93 MB – 67.89 MB** `IndexedDB` + **17.59 MB – 22.85 MB** `LocalExt` | **Audited & Preserved without corruption** | `scripts/Audit-BraveExtensionStorage.ps1` |
 | **`Profile 2` Tab Suspender Storage Footprint** | **11.28 MB – 15.79 MB** `IndexedDB` + **25.50 MB – 29.60 MB** `LocalExt` | **Audited & Preserved without corruption** | `scripts/Audit-BraveExtensionStorage.ps1` |
 

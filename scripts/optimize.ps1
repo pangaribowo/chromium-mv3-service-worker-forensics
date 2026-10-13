@@ -27,6 +27,102 @@ function Format-Size($bytes) {
     return "$([math]::Round($bytes/1KB, 2)) KB"
 }
 
+function Repair-ChromiumServiceWorker($profileDir, $browserLabel) {
+    $swPath = Join-Path $profileDir.FullName "Service Worker"
+    if (-not (Test-Path $swPath)) { return }
+
+    $swDbPath = Join-Path $swPath "Database"
+    $swScPath = Join-Path $swPath "ScriptCache"
+    $swCsPath = Join-Path $swPath "CacheStorage"
+
+    $dbFiles = @(if (Test-Path $swDbPath) { Get-ChildItem $swDbPath -File -ErrorAction SilentlyContinue })
+    $dbCurrent = Get-Item (Join-Path $swDbPath "CURRENT") -ErrorAction SilentlyContinue
+    if ((-not $dbCurrent) -or ($dbFiles.Count -eq 0)) {
+        if ((Test-Path $swDbPath) -or (Test-Path $swScPath) -or (Test-Path $swCsPath)) {
+            if (Test-Path $swDbPath) { Remove-Item $swDbPath -Recurse -Force -ErrorAction SilentlyContinue }
+            if (Test-Path $swScPath) { Remove-Item $swScPath -Recurse -Force -ErrorAction SilentlyContinue }
+            if (Test-Path $swCsPath) { Remove-Item $swCsPath -Recurse -Force -ErrorAction SilentlyContinue }
+            Write-Ok "Cleaned orphaned $browserLabel Service Worker cache on closed profile ($($profileDir.Name))"
+        }
+        return
+    }
+
+    $scIndex = Get-Item (Join-Path $swScPath "index") -ErrorAction SilentlyContinue
+    $scPayloads = @(if (Test-Path $swScPath) { Get-ChildItem $swScPath -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin @("index", "the-real-index") } })
+    $scEntryCount = @($scPayloads | Where-Object { $_.Name -like "*_0" }).Count
+
+    $latin1 = [System.Text.Encoding]::GetEncoding(28591)
+    $rxLdbExt = [regex]::new('(?<![a-z])([a-p]{32})(?![a-z])')
+    $rxLogExt = [regex]::new('REG:chrome-extension://([a-p]{32})')
+    $extRegState = @{}
+    $hasAnyRegistration = $false
+
+    foreach ($lf in ($dbFiles | Where-Object { $_.Extension -in ".ldb", ".log" } | Sort-Object Extension, Name)) {
+        $fs = $null
+        try {
+            $fs = [System.IO.File]::Open($lf.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            $bytes = New-Object byte[] $fs.Length
+            [void]$fs.Read($bytes, 0, $bytes.Length)
+        } catch { continue }
+        finally { if ($fs) { $fs.Dispose() } }
+
+        try {
+            $rawText = $latin1.GetString($bytes)
+            if ($lf.Extension -eq ".ldb") {
+                if ($rawText.Contains("REG:") -or $rawText.Contains("UNIQUE_ORIGIN:") -or $rawText.Contains("ID_TO_ORIGIN:")) {
+                    $hasAnyRegistration = $true
+                }
+                foreach ($m in $rxLdbExt.Matches($rawText)) {
+                    $extId = $m.Groups[1].Value
+                    $hasAnyRegistration = $true
+                    if (-not $extRegState.ContainsKey($extId)) { $extRegState[$extId] = 1 }
+                }
+            } elseif ($lf.Extension -eq ".log") {
+                if ($rawText.Contains("REG:")) { $hasAnyRegistration = $true }
+                foreach ($m in $rxLogExt.Matches($rawText)) {
+                    $hasAnyRegistration = $true
+                    $i = $m.Index
+                    $extId = $m.Groups[1].Value
+                    if ($i -ge 2) {
+                        $t = [int]$bytes[$i - 2]
+                        $k = [int]$bytes[$i - 1]
+                        if ($t -in @(0, 1) -and $k -ge 50 -and $k -le 120) {
+                            $extRegState[$extId] = $t
+                        }
+                    }
+                }
+            }
+        } catch {}
+    }
+
+    $deletedExts = @($extRegState.GetEnumerator() | Where-Object { $_.Value -eq 0 })
+    $activeExts  = @($extRegState.GetEnumerator() | Where-Object { $_.Value -eq 1 })
+    $scWipedAfterDb = (-not $scIndex) -or (($scIndex.CreationTime - $dbCurrent.CreationTime).TotalMinutes -gt 2)
+
+    $isDesynced = ($deletedExts.Count -gt 0) -or
+                  ($hasAnyRegistration -and ($scPayloads.Count -eq 0)) -or
+                  ($activeExts.Count -gt 0 -and ($scEntryCount -lt $activeExts.Count)) -or
+                  ($hasAnyRegistration -and $scWipedAfterDb)
+
+    if ($isDesynced) {
+        $lockFile = Join-Path $swDbPath "LOCK"
+        $isLocked = $false
+        if (Test-Path $lockFile) {
+            $fsLock = $null
+            try {
+                $fsLock = [System.IO.File]::Open($lockFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            } catch { $isLocked = $true }
+            finally { if ($fsLock) { $fsLock.Dispose() } }
+        }
+        if (-not $isLocked) {
+            if (Test-Path $swDbPath) { Remove-Item $swDbPath -Recurse -Force -ErrorAction SilentlyContinue }
+            if (Test-Path $swScPath) { Remove-Item $swScPath -Recurse -Force -ErrorAction SilentlyContinue }
+            if (Test-Path $swCsPath) { Remove-Item $swCsPath -Recurse -Force -ErrorAction SilentlyContinue }
+            Write-Ok "Re-synced $browserLabel Service Worker storage on closed profile ($($profileDir.Name))"
+        }
+    }
+}
+
 function Invoke-Status {
     Write-Section "SYSTEM HEALTH REPORT"
     
@@ -84,7 +180,7 @@ function Invoke-Status {
     )
     
     $braveBase = "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data"
-    $braveProfiles = Get-ChildItem $braveBase -Directory -Filter "Profile*" -ErrorAction SilentlyContinue
+    $braveProfiles = Get-ChildItem $braveBase -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "Profile*" -or $_.Name -eq "Default" }
     foreach ($bp in $braveProfiles) {
         $targets += @{ Name = "Brave Cache ($($bp.Name))"; Path = "$($bp.FullName)\Cache" }
     }
@@ -167,36 +263,7 @@ function Invoke-Clean {
         }
 
         # Self-heal closed profiles if Service Worker\ScriptCache was previously wiped out of sync with Database
-        $swPath = Join-Path $bp.FullName "Service Worker"
-        $swDbPath = Join-Path $swPath "Database"
-        $swScPath = Join-Path $swPath "ScriptCache"
-        $swCsPath = Join-Path $swPath "CacheStorage"
-        $dbCurrent = Get-Item (Join-Path $swDbPath "CURRENT") -ErrorAction SilentlyContinue
-        if ($dbCurrent) {
-            $scIndex = Get-Item (Join-Path $swScPath "index") -ErrorAction SilentlyContinue
-            $scPayloads = @(if (Test-Path $swScPath) { Get-ChildItem $swScPath -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin @("index", "the-real-index") } })
-            if ((-not $scIndex) -or ($scPayloads.Count -eq 0) -or (($scIndex.CreationTime - $dbCurrent.CreationTime).TotalMinutes -gt 2)) {
-                $lockFile = Join-Path $swDbPath "LOCK"
-                $isLocked = $false
-                if (Test-Path $lockFile) {
-                    $fsLock = $null
-                    try {
-                        $fsLock = [System.IO.File]::Open($lockFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
-                    } catch { $isLocked = $true }
-                    finally { if ($fsLock) { $fsLock.Dispose() } }
-                }
-                if (-not $isLocked) {
-                    if (Test-Path $swDbPath) { Remove-Item $swDbPath -Recurse -Force -ErrorAction SilentlyContinue }
-                    if (Test-Path $swScPath) { Remove-Item $swScPath -Recurse -Force -ErrorAction SilentlyContinue }
-                    if (Test-Path $swCsPath) { Remove-Item $swCsPath -Recurse -Force -ErrorAction SilentlyContinue }
-                    Write-Ok "Re-synced Service Worker storage on closed profile ($($bp.Name))"
-                }
-            }
-        } elseif ((Test-Path $swScPath) -or (Test-Path $swCsPath)) {
-            if (Test-Path $swScPath) { Remove-Item $swScPath -Recurse -Force -ErrorAction SilentlyContinue }
-            if (Test-Path $swCsPath) { Remove-Item $swCsPath -Recurse -Force -ErrorAction SilentlyContinue }
-            Write-Ok "Cleaned orphaned Service Worker cache on closed profile ($($bp.Name))"
-        }
+        Repair-ChromiumServiceWorker -profileDir $bp -browserLabel "Brave"
     }
     $freedTotal += $braveFreed
     Write-Del "Brave Browser Cache: $(Format-Size $braveFreed)"
@@ -216,6 +283,9 @@ function Invoke-Clean {
                 $chromeFreed += $size
             }
         }
+
+        # Self-heal closed Chrome profiles if Service Worker\ScriptCache was previously wiped out of sync with Database
+        Repair-ChromiumServiceWorker -profileDir $cp -browserLabel "Chrome"
     }
     $freedTotal += $chromeFreed
     Write-Del "Chrome Browser Cache: $(Format-Size $chromeFreed)"

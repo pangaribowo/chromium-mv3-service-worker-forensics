@@ -30,7 +30,9 @@ if (-not (Test-Path $BraveUserDataPath)) {
 }
 
 $profiles = @(Get-ChildItem $BraveUserDataPath -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "Profile*" -or $_.Name -eq "Default" })
-$needleExt = [System.Text.Encoding]::ASCII.GetBytes("REG:chrome-extension://$ExtensionId")
+$latin1 = [System.Text.Encoding]::GetEncoding(28591)
+$rxLogTarget = [regex]::new("REG:chrome-extension://$([regex]::Escape($ExtensionId))", [System.Text.RegularExpressions.RegexOptions]::Compiled)
+$rxLdbTarget = [regex]::new("(?<![a-z])$([regex]::Escape($ExtensionId))(?![a-z])", [System.Text.RegularExpressions.RegexOptions]::Compiled)
 
 $results = @()
 
@@ -56,7 +58,8 @@ foreach ($prof in $profiles) {
         $scFiles = @(if (Test-Path $swScPath) { Get-ChildItem $swScPath -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin @("index", "the-real-index") } })
         $scPayloads = $scFiles.Count
 
-        if (-not (Test-Path $swDbPath)) {
+        $dbCurrentPath = Join-Path $swDbPath "CURRENT"
+        if ((-not (Test-Path $swDbPath)) -or (-not (Test-Path $dbCurrentPath))) {
             $swStatus = "Clean/Reset (Ready)"
         } else {
             $regType = -1
@@ -70,17 +73,20 @@ foreach ($prof in $profiles) {
                 } catch { continue }
                 finally { if ($fs) { $fs.Dispose() } }
 
-                for ($i = 0; $i -le $bytes.Length - $needleExt.Length; $i++) {
-                    $match = $true
-                    for ($j = 0; $j -lt $needleExt.Length; $j++) {
-                        if ($bytes[$i + $j] -ne $needleExt[$j]) { $match = $false; break }
+                $rawText = $latin1.GetString($bytes)
+                if ($lf.Extension -eq ".ldb") {
+                    if ($rxLdbTarget.IsMatch($rawText) -and $regType -eq -1) {
+                        $regType = 1
                     }
-                    if ($match) {
-                        if ($lf.Extension -eq ".log" -and $i -ge 2) {
+                } elseif ($lf.Extension -eq ".log") {
+                    foreach ($m in $rxLogTarget.Matches($rawText)) {
+                        $i = $m.Index
+                        if ($i -ge 2) {
                             $t = [int]$bytes[$i - 2]
-                            if ($t -in @(0, 1)) { $regType = $t }
-                        } elseif ($lf.Extension -eq ".ldb" -and $regType -eq -1) {
-                            $regType = 1
+                            $k = [int]$bytes[$i - 1]
+                            if ($t -in @(0, 1) -and $k -ge 50 -and $k -le 120) {
+                                $regType = $t
+                            }
                         }
                     }
                 }

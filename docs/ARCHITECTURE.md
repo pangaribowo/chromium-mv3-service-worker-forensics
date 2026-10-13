@@ -48,12 +48,16 @@ Tombstone:   │ 0x00 (Deleted) │ 0x38 (56)      │ "REG:chrome-extension://"
 * **`ValueType = 0x01` (`leveldb::kTypeValue`):** The registration is active; followed by the varint value length and serialized `ServiceWorkerRegistrationData` protobuf.
 * **`ValueType = 0x00` (`leveldb::kTypeDeletion`):** A deletion tombstone appended when Chromium invalidates and unregisters the Service Worker (e.g., upon encountering `ServiceWorkerStatusCode::kErrorDiskCache`). No value payload follows a `0x00` record.
 
-### 1.2 LevelDB SSTable (`.ldb`) vs `.log` Precedence
-During forensic scanning (`scripts/Fix-BraveExtensions.ps1`):
-1. Compacted SSTable files (`.ldb`) are scanned first in ascending order to establish baseline registrations (`type = 1`).
-2. Uncompacted Write-Ahead Log files (`.log`) are scanned second in ascending order. Any `WriteBatch` record in `.log` overrides the `.ldb` state for that 32-character extension ID (`extRegState[$extId] = $typeByte`).
+### 1.2 LevelDB SSTable (`.ldb`) Prefix/Snappy Compression vs `.log` Precedence
+In compacted LevelDB SSTable files (`*.ldb`, such as `Profile 2\Service Worker\Database\000009.ldb`), LevelDB stores keys in lexicographical order (`ID_TO_ORIGIN:...`, `INIT_DATA_TYPE:...`, `REG:chrome-extension://...`, `REG:https://...`, `RES:...`, `UNIQUE_ORIGIN:chrome-extension://...`) and applies two layers of compression within each SSTable data block:
+1. **Restart-Block Prefix Delta Encoding (`shared_bytes`):** Adjacent keys sharing a common prefix omit the repeated prefix bytes (`"REG:"` or `"REG:chrome-extension://"`).
+2. **Snappy LZ77 Block Compression:** Because `"REG:"` and `"chrome-extension://"` already appear earlier in the block (e.g., under `ID_TO_ORIGIN:` and `UNIQUE_ORIGIN:`), Snappy replaces subsequent `"REG:chrome-extension://"` occurrences with 2-byte LZ77 copy back-references. Consequently, a real compacted `.ldb` file (`000009.ldb`, 10,853 bytes, 9 registered extensions) contains **zero** literal occurrences of the 23-byte string `"REG:chrome-extension://"`, while preserving the high-entropy 32-character mpdecimal SHA-256 extension IDs (`[a-p]{32}`) as literal ASCII sequences.
+
+During forensic scanning (`scripts/Fix-BraveExtensions.ps1`, `scripts/Audit-BraveExtensionStorage.ps1`, and `Repair-ChromiumServiceWorker` in `scripts/optimize.ps1`):
+1. Compacted SSTable files (`.ldb`) are decoded using 1-to-1 ISO-8859-1 (Latin1) byte-to-char mapping and scanned first in ascending order via compiled regex `(?<![a-z])([a-p]{32})(?![a-z])` to establish baseline extension registrations (`type = 1`).
+2. Uncompacted Write-Ahead Log files (`.log`) are scanned second in ascending order via compiled regex `REG:chrome-extension://([a-p]{32})`, inspecting `ValueType` at `[offset - 2]` and `KeyLength` at `[offset - 1]`. Any `WriteBatch` record in `.log` overrides the `.ldb` state for that 32-character extension ID (`extRegState[$extId] = $typeByte`).
 3. **Time & Space Complexity of Forensic Scanner:**
-   * **Time Complexity:** $\mathcal{O}(B)$ per profile where $B$ is the total byte size of `.ldb` and `.log` files in `Service Worker\Database` (typically $32\text{ KB} \le B \le 512\text{ KB}$ per profile, completing across 18 profiles in $< 1.5\text{ seconds}$).
+   * **Time Complexity:** $\mathcal{O}(B)$ per profile via compiled .NET regular expressions over Latin1 buffers where $B$ is the total byte size of `.ldb` and `.log` files in `Service Worker\Database` (completing across all 18 Brave profiles in **~485 ms**).
    * **Space Complexity:** $\mathcal{O}(B_{\max} + E)$ where $B_{\max}$ is the size of the largest single LevelDB file buffer in memory and $E$ is the number of distinct registered extension IDs.
 
 ---

@@ -88,18 +88,21 @@ $cacheDirs = @(
 
 ### 3.1 Patching the Root Cause in `optimize.ps1`
 1. Removed `"Service Worker\ScriptCache"` and `"Service Worker\CacheStorage"` from `$cacheDirs` for both Brave and Chrome in `optimize.ps1`.
-2. Added an **atomic self-healing check** inside `optimize.ps1` (`Invoke-Clean`) so that if any closed profile exhibits `Database\CURRENT` vs `ScriptCache\index` desynchronization (or `0` payload files in `ScriptCache`), all three directories (`Database`, `ScriptCache`, and `CacheStorage`) are removed atomically while preserving `Local Extension Settings` and `IndexedDB`.
+2. Added a shared **`Repair-ChromiumServiceWorker` atomic self-healing function** inside `optimize.ps1` (`Invoke-Clean`) covering **both Brave and Google Chrome profiles**. Whenever any closed profile exhibits an empty/orphaned `Database`, `Database\CURRENT` vs `ScriptCache\index` timestamp desynchronization, `0` payload files in `ScriptCache`, fewer `_0` script entries than active extensions in `.ldb`/`.log`, or a LevelDB `.log` `type=0` deletion tombstone, all three directories (`Database`, `ScriptCache`, and `CacheStorage`) are removed atomically while preserving `Local Extension Settings` and `IndexedDB`.
 
-### 3.2 Executing `Fix-BraveExtensions.ps1` Across All 18 Profiles
-We authored and executed `Fix-BraveExtensions.ps1` to scan binary LevelDB `.ldb` and `.log` files across all profiles:
-* **14 Closed Profiles (`Profile 3, 7, 10, 11, 12, 13, 14, 16, 17, 18, 20, 21, 24, 28`):** Automatically healed on disk by atomically resetting `Service Worker\Database`, `ScriptCache`, and `CacheStorage` without touching extension user data.
-* **4 Open Profiles (`Profile 2, 6, 9, 22`):** Detected as locked (`Database\LOCK` held by active `brave.exe` processes) with `Tab Suspender = type=0`. Guided the user to execute **`brave://restart`** in the address bar so Brave gracefully closes, releases the locks, re-registers the Service Workers, and restores all suspended `park.html` tabs without loss.
+### 3.2 Executing `Fix-BraveExtensions.ps1` Across All 18 Brave Profiles & 10 Google Chrome Profiles
+We authored and executed `Fix-BraveExtensions.ps1` to scan binary LevelDB `.ldb` (handling prefix-delta and Snappy LZ77 compression via `[a-p]{32}` extraction) and `.log` (`WriteBatch` `[typeByte][keyLenByte]`) files across all profiles:
+* **14 Closed Brave Profiles (`Profile 3, 7, 10, 11, 12, 13, 14, 16, 17, 18, 20, 21, 24, 28`):** Automatically healed on disk by atomically resetting `Service Worker\Database`, `ScriptCache`, and `CacheStorage` without touching extension user data.
+* **10 Closed Google Chrome Profiles (`Profile 1, 2, 3, 5, 7, 8, 9, 10, 14, 15`):** Also discovered to have been desynchronized/orphaned by the legacy `optimize.ps1` Chrome loop (`Profile 1` had 27 extensions in `000003.log` with a `+17,377 min` `ScriptCache` desync; 9 profiles had orphaned empty `Database` + `ScriptCache`/`CacheStorage` directories). All 10 Chrome profiles were automatically healed to `Clean/Reset (Ready)`.
+* **4 Open Brave Profiles (`Profile 2, 6, 9, 22`):** Detected as locked (`Database\LOCK` held by active `brave.exe` processes) with `Tab Suspender = type=0`. Guided the user to execute **`brave://restart`** in the address bar so Brave gracefully closes, releases the locks, re-registers the Service Workers, and restores all suspended `park.html` tabs without loss.
 
-### 3.3 Automated Edge-Case Verification Suite
-Verified `Fix-BraveExtensions.ps1` against a synthetic 5-profile test harness (`$env:TEMP\BraveSWTest_*`) testing:
-1. `Profile 1` (Healthy `type=1` with synced `ScriptCache`) → **Preserved (`True`)**
-2. `Profile 2` (`type=0` deletion tombstone in `.log` + `Local Extension Settings` user data) → **SW Reset & User Data Preserved (`True`)**
+### 3.3 Automated 7-Profile Edge-Case Verification Suite
+Verified `Fix-BraveExtensions.ps1` and `Audit-BraveExtensionStorage.ps1` against a 7-profile test harness (`$env:TEMP\BraveFullEdgeSuite`) including the real compacted `000009.ldb` SSTable from `Profile 2`:
+1. `Profile 1` (Healthy `.log` `type=1` with synced `ScriptCache`) → **Preserved (`True`)**
+2. `Profile 2` (`.log` `type=0` deletion tombstone + `Local Extension Settings` user data) → **SW Reset & User Data Preserved (`True`)**
 3. `Profile 3` (Timestamp desync between `Database\CURRENT` and `ScriptCache\index`) → **Detected & Reset (`True`)**
 4. `Profile 4` (Active `Database\LOCK` held with `FileShare.None`) → **Skipped Safely & Flagged `[OPEN]` (`True`)**
-5. `Profile 5` (Orphaned `ScriptCache` without `Database`) → **Cleaned (`True`)**
-6. **Second Pass (Idempotency):** Reported `0` fixed and `4` healthy closed profiles (`True`).
+5. `Profile 5` (Empty `Database` folder + Orphaned `ScriptCache`) → **Both Cleaned (`True`)**
+6. `Profile 6` (Real Snappy/prefix-compressed `000009.ldb` with 9 extensions & 0 literal `"REG:chrome-extension://"` strings, paired with partial 1-file `ScriptCache`) → **Detected (`ActiveExts=9, scEntryCount=1`) & Reset (`True`)**
+7. `Profile 7` (Real Snappy/prefix-compressed `000009.ldb` with 9 matching `_0` scripts in `ScriptCache`) → **Preserved as Healthy (`True`)**
+8. **Second Pass (Idempotency):** Reported `0` fixed, `6` healthy closed profiles, and `1` open locked profile (`True`).
