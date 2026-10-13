@@ -1,0 +1,22 @@
+# Windows thumbnails and metadata
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# PowerShell transient data
+*.ps1xml
+*~
+
+# Visual Studio Code & Editors
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
